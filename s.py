@@ -20,10 +20,11 @@ import os
 import re
 import time
 import random
+import signal
 import asyncio
+import logging
 import unicodedata
-from collections import defaultdict
-from datetime import datetime
+from collections import defaultdict, deque
 
 import discord
 from discord.ext import commands
@@ -31,15 +32,33 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID_RAW = os.getenv("CHANNEL_ID")
+# ---------------------------------------------------------------------------
+# Config -- tune these via .env without touching code
+# ---------------------------------------------------------------------------
+DISCORD_TOKEN         = os.getenv("DISCORD_TOKEN")
+CHANNEL_ID_RAW        = os.getenv("CHANNEL_ID")
+GAME_MASTER_BOT_ID    = int(os.getenv("GAME_MASTER_BOT_ID", "1103932552701550622"))
+REQUIRED_REACTIONS    = int(os.getenv("REQUIRED_REACTIONS", "2"))
+MIN_SEND_INTERVAL     = int(os.getenv("MIN_SEND_INTERVAL", "120"))
+# How many recently-used words to remember before allowing repeats
+USED_WORDS_MAXLEN     = int(os.getenv("USED_WORDS_MAXLEN", "500"))
 
 WORDS_FILE = "vietnamese_words.txt"
-LOG_FILE = "channel_messages.log"
+LOG_FILE   = "channel_messages.log"
 
-GAME_MASTER_BOT_ID = 1103932552701550622
-REQUIRED_REACTIONS = 2
-MIN_SEND_INTERVAL = 120
+# ---------------------------------------------------------------------------
+# Logging setup -- replaces all the scattered print() calls
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ],
+)
+log = logging.getLogger(__name__)
 
 
 def normalize(text: str) -> str:
@@ -53,30 +72,54 @@ class NoiTuSelfbot:
         if not CHANNEL_ID_RAW:
             raise SystemExit("CHANNEL_ID missing from .env")
 
-        self.token = DISCORD_TOKEN
+        self.token      = DISCORD_TOKEN
         self.channel_id = int(CHANNEL_ID_RAW)
 
-        self.phrases: set[str] = set()
+        self.phrases: set[str]                          = set()
         self.phrases_by_first_syllable: dict[str, list[str]] = defaultdict(list)
 
-        self.last_word: str | None = None
+        self.last_word:            str | None = None
         self.last_word_message_id: int | None = None
-        self.used_words: set[str] = set()
-        self.xd_messages: set[int] = set()
+
+        # Bounded deque so old words become eligible again after USED_WORDS_MAXLEN entries
+        self.used_words: deque[str] = deque(maxlen=USED_WORDS_MAXLEN)
+        self._used_words_set: set[str] = set()   # mirror for O(1) lookup
+
+        self.xd_messages:        set[int] = set()
         self.validated_messages: set[int] = set()
 
-        self.word_ready = asyncio.Event()
+        self.word_ready     = asyncio.Event()
         self.last_send_time = 0.0
 
         self.client = commands.Bot(command_prefix="nt!", help_command=None)
-
         self.client.event(self.on_ready)
         self.client.event(self.on_message)
         self.client.event(self.on_reaction_add)
 
     MAX_SYLLABLES = 2
 
-    async def load_words(self):
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _track_used(self, word: str) -> None:
+        """Add word to the bounded used-words tracker."""
+        if len(self.used_words) == self.used_words.maxlen:
+            # The deque will evict the oldest entry; mirror the removal
+            self._used_words_set.discard(self.used_words[0])
+        self.used_words.append(word)
+        self._used_words_set.add(word)
+
+    def _log_to_file(self, message: discord.Message, prefix: str = "") -> None:
+        """Single helper that writes a structured line to the log file."""
+        content = message.content.replace("\n", " ")
+        log.info("%s%s: %s", prefix, self._display_author(message), content)
+
+    # ------------------------------------------------------------------
+    # Word loading & selection
+    # ------------------------------------------------------------------
+
+    async def load_words(self) -> None:
         skipped = 0
         try:
             with open(WORDS_FILE, "r", encoding="utf-8") as f:
@@ -90,31 +133,31 @@ class NoiTuSelfbot:
                         continue
                     self.phrases.add(phrase)
                     self.phrases_by_first_syllable[syllables[0]].append(phrase)
-            print(f"Loaded {len(self.phrases)} 2-syllable words (skipped {skipped})")
+            log.info("Loaded %d 2-syllable words (skipped %d)", len(self.phrases), skipped)
         except FileNotFoundError:
-            print(f"{WORDS_FILE} not found!")
+            log.error("%s not found!", WORDS_FILE)
             raise SystemExit(1)
 
     def get_next_word(self, last_phrase: str) -> str | None:
         if not last_phrase:
             return None
-        last_phrase = normalize(last_phrase)
-        syllables = last_phrase.split()
+        last_phrase  = normalize(last_phrase)
+        syllables    = last_phrase.split()
         if not syllables:
             return None
 
         last_syllable = syllables[-1]
-        candidates = self.phrases_by_first_syllable.get(last_syllable, [])
+        candidates    = self.phrases_by_first_syllable.get(last_syllable, [])
         if not candidates:
             return None
 
-        fresh = [c for c in candidates if c != last_phrase and c not in self.used_words]
-        pool = fresh or [c for c in candidates if c != last_phrase] or candidates
+        fresh = [c for c in candidates if c != last_phrase and c not in self._used_words_set]
+        pool  = fresh or [c for c in candidates if c != last_phrase] or candidates
         return random.choice(pool)
 
     def find_last_valid_phrase(self, content: str) -> str | None:
-        text = normalize(content)
-        tokens = re.findall(r"\w+", text, re.UNICODE)
+        text   = normalize(content)
+        tokens = re.findall(r"\w+", text)   # re.UNICODE is default for str in Python 3
         if not tokens:
             return None
 
@@ -123,53 +166,50 @@ class NoiTuSelfbot:
             return None
 
         phrase = " ".join(last_tokens)
-        if phrase in self.phrases:
-            return phrase
-        return None
+        return phrase if phrase in self.phrases else None
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _display_author(message: discord.Message) -> str:
         author = message.author
+        # discriminator is "0" or absent on the new username system
         disc = getattr(author, "discriminator", "0")
         if not disc or disc == "0":
             return author.name
         return f"{author.name}#{disc}"
 
-    async def check_bot_x_reaction(self, message: discord.Message) -> bool:
-        for reaction in message.reactions:
-            if str(reaction.emoji) != "X":
-                continue
-            async for user in reaction.users():
-                if user.id == self.client.user.id:
-                    return True
-        return False
+    @staticmethod
+    def _bot_x_reaction(message: discord.Message, bot_id: int) -> bool:
+        """
+        Check whether the bot has already placed an 'X' reaction on this message.
+        Uses reaction.me (cached) instead of paginating reaction.users() -- no extra API call.
+        """
+        return any(str(r.emoji) == "X" and r.me for r in message.reactions)
 
-    def log_message(self, message: discord.Message):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        content = message.content.replace("\n", " ")
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"[{timestamp}] {self._display_author(message)}: {content}\n")
+    # ------------------------------------------------------------------
+    # Discord events
+    # ------------------------------------------------------------------
 
-    def log_reaction(self, message: discord.Message, count: int):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        content = message.content.replace("\n", " ")
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"[{timestamp}] VALIDATED ({count} reactions): "
-                    f"{self._display_author(message)}: {content}\n")
-
-    async def on_ready(self):
-        print(f"Logged in as {self.client.user} (ID: {self.client.user.id})")
-        print(f"Targeting channel ID {self.channel_id}")
+    async def on_ready(self) -> None:
+        log.info("Logged in as %s (ID: %s)", self.client.user, self.client.user.id)
+        log.info("Targeting channel ID %s", self.channel_id)
         self.client.loop.create_task(self.game_loop())
         self.client.loop.create_task(self.heartbeat_check())
 
-    async def heartbeat_check(self):
+    async def heartbeat_check(self) -> None:
         await self.client.wait_until_ready()
         while not self.client.is_closed():
             await asyncio.sleep(30)
-            print(f"[heartbeat] last_word: {self.last_word} | "
-                  f"last_msg_id: {self.last_word_message_id} | "
-                  f"xd: {len(self.xd_messages)} | validated: {len(self.validated_messages)}")
+            log.info(
+                "[heartbeat] last_word=%s | last_msg_id=%s | xd=%d | validated=%d",
+                self.last_word,
+                self.last_word_message_id,
+                len(self.xd_messages),
+                len(self.validated_messages),
+            )
 
     async def _evaluate_message(
         self, message: discord.Message, allow_update: bool = True
@@ -178,7 +218,7 @@ class NoiTuSelfbot:
             return False
         if message.id in self.xd_messages or message.id in self.validated_messages:
             return False
-        if await self.check_bot_x_reaction(message):
+        if self._bot_x_reaction(message, self.client.user.id):
             self.xd_messages.add(message.id)
             return False
 
@@ -191,33 +231,37 @@ class NoiTuSelfbot:
             return False
 
         self.validated_messages.add(message.id)
-        self.log_reaction(message, total_reactions)
-        print(f"Message {message.id} validated ({total_reactions} reactions) -> '{phrase}'")
+        self._log_to_file(message, prefix=f"VALIDATED ({total_reactions} reactions) ")
+        log.info("Message %d validated (%d reactions) -> '%s'",
+                 message.id, total_reactions, phrase)
 
         if allow_update:
             if (
                 self.last_word_message_id is None
                 or message.id > self.last_word_message_id
             ):
-                self.last_word = phrase
+                self.last_word            = phrase
                 self.last_word_message_id = message.id
                 self.word_ready.set()
-                print(f"  -> last_word updated to '{phrase}' (msg_id={message.id})")
+                log.info("  -> last_word updated to '%s' (msg_id=%d)", phrase, message.id)
             else:
-                print(f"  -> skipped (message {message.id} is older than "
-                      f"current last_word from msg {self.last_word_message_id})")
+                log.info(
+                    "  -> skipped (message %d is older than current last_word from msg %d)",
+                    message.id, self.last_word_message_id,
+                )
                 return False
         return True
 
-    async def on_reaction_add(self, reaction: discord.Reaction, user: discord.User):
+    async def on_reaction_add(self, reaction: discord.Reaction, user: discord.User) -> None:
         message = reaction.message
         if message.channel.id != self.channel_id:
             return
 
+        # Bot placed an 'X' -- invalidate the message
         if user.id == self.client.user.id and str(reaction.emoji) == "X":
             self.xd_messages.add(message.id)
             self.validated_messages.discard(message.id)
-            print(f"Bot X'd message {message.id} from {message.author.name}")
+            log.info("Bot X'd message %d from %s", message.id, message.author.name)
             if self.last_word:
                 phrase = self.find_last_valid_phrase(message.content)
                 if (
@@ -225,9 +269,9 @@ class NoiTuSelfbot:
                     and phrase == self.last_word
                     and message.id == self.last_word_message_id
                 ):
-                    self.last_word = None
+                    self.last_word            = None
                     self.last_word_message_id = None
-                    print("Cleared last_word because bot X'd the validated message")
+                    log.info("Cleared last_word because bot X'd the validated message")
             return
 
         if message.author.id == self.client.user.id:
@@ -235,7 +279,7 @@ class NoiTuSelfbot:
 
         await self._evaluate_message(message)
 
-    async def on_message(self, message: discord.Message):
+    async def on_message(self, message: discord.Message) -> None:
         if message.channel.id != self.channel_id:
             return
         if message.author.id == self.client.user.id:
@@ -246,53 +290,54 @@ class NoiTuSelfbot:
         if message.author.id == GAME_MASTER_BOT_ID:
             content_lower = message.content.lower()
 
-            # "khong co trong tu dien" -- just ignore it entirely.
-            # Don't clear last_word. The bot should keep whatever word
-            # was last validated and wait for the next round to start.
+            # "khong co trong tu dien" -- not a real word, ignore.
+            # Keep last_word so we can still respond when a valid word arrives.
             if "khong co trong tu dien" in content_lower:
-                print(
-                    f"GM says 'khong co trong tu dien' -- "
-                    f"ignoring, keeping last_word='{self.last_word}'"
+                log.info(
+                    "GM says 'khong co trong tu dien' -- ignoring, keeping last_word='%s'",
+                    self.last_word,
                 )
                 return
 
             # "Luot noi tu moi da bat dau voi tu **{word}**!"
             match = re.search(r"\*\*(.+?)\*\*", message.content)
             if match:
-                phrase = normalize(match.group(1))
+                phrase    = normalize(match.group(1))
                 syllables = phrase.split()
 
                 if len(syllables) != self.MAX_SYLLABLES:
-                    print(
-                        f"GM announced '{phrase}' ({len(syllables)} syllables) -- "
-                        f"not a valid 2-syllable word. Ignoring."
+                    log.info(
+                        "GM announced '%s' (%d syllables) -- not a valid 2-syllable word. Ignoring.",
+                        phrase, len(syllables),
                     )
                     return
 
-                self.last_word = phrase
+                self.last_word            = phrase
                 self.last_word_message_id = message.id
                 self.word_ready.set()
-                print(
-                    f"New round from GM! Starting word: '{phrase}' "
-                    f"(msg_id={message.id})"
-                )
+                log.info("New round from GM! Starting word: '%s' (msg_id=%d)",
+                         phrase, message.id)
             return
 
-        if await self.check_bot_x_reaction(message):
+        if self._bot_x_reaction(message, self.client.user.id):
             self.xd_messages.add(message.id)
             return
 
-        self.log_message(message)
+        self._log_to_file(message)
         await self._evaluate_message(message)
 
-    async def game_loop(self):
+    # ------------------------------------------------------------------
+    # Game loop
+    # ------------------------------------------------------------------
+
+    async def game_loop(self) -> None:
         await self.client.wait_until_ready()
         channel = self.client.get_channel(self.channel_id)
         if channel is None:
-            print("Channel not found, I'm out.")
+            log.error("Channel %d not found, bailing out.", self.channel_id)
             return
 
-        print(f"Game loop started (min {MIN_SEND_INTERVAL}s between replies)")
+        log.info("Game loop started (min %ds between replies)", MIN_SEND_INTERVAL)
 
         while not self.client.is_closed():
             await self.word_ready.wait()
@@ -301,40 +346,57 @@ class NoiTuSelfbot:
             if self.last_word is None:
                 continue
 
-            elapsed = time.monotonic() - self.last_send_time
+            # Respect the minimum send interval
+            elapsed   = time.monotonic() - self.last_send_time
             wait_left = MIN_SEND_INTERVAL - elapsed
             if wait_left > 0:
                 await asyncio.sleep(wait_left)
 
+            # last_word may have been cleared while we were waiting
             if self.last_word is None:
                 continue
 
             current_word = self.last_word
-            next_word = self.get_next_word(current_word)
+            next_word    = self.get_next_word(current_word)
 
             try:
                 if next_word is None:
                     last_syl = current_word.split()[-1]
-                    print(f"No word starts with '{last_syl}', skipping silently.")
+                    log.info("No word starts with '%s', skipping silently.", last_syl)
                 else:
                     await channel.send(next_word)
-                    self.used_words.add(next_word)
-                    print(f"Sent: '{next_word}'")
-            except discord.HTTPException as e:
-                print(f"Failed to send message: {e}")
+                    self._track_used(next_word)
+                    log.info("Sent: '%s'", next_word)
+            except discord.HTTPException as exc:
+                log.error("Failed to send message: %s", exc)
 
-            self.last_send_time = time.monotonic()
-            self.last_word = None
+            self.last_send_time       = time.monotonic()
+            self.last_word            = None
             self.last_word_message_id = None
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     bot = NoiTuSelfbot()
     asyncio.run(bot.load_words())
+
+    # Graceful shutdown on SIGINT / SIGTERM
+    loop = asyncio.get_event_loop()
+
+    def _shutdown(sig, frame):  # noqa: ANN001
+        log.info("Received %s, shutting down...", signal.Signals(sig).name)
+        loop.create_task(bot.client.close())
+
+    for _sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(_sig, _shutdown)
+
     try:
-        print("Starting bot...")
+        log.info("Starting bot...")
         bot.client.run(bot.token)
     except discord.LoginFailure:
-        print("Invalid token, fix your .env dude")
-    except Exception as e:
-        print(f"Bot crashed: {e}")
+        log.error("Invalid token -- fix your .env")
+    except Exception:
+        log.exception("Bot crashed")   # prints full traceback, not just the message
