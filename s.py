@@ -26,10 +26,14 @@ load_dotenv()
 DISCORD_TOKEN      = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID_RAW     = os.getenv("CHANNEL_ID")
 GAME_MASTER_BOT_ID = int(os.getenv("GAME_MASTER_BOT_ID", "1103932552701550622"))
-MIN_SEND_INTERVAL  = int(os.getenv("MIN_SEND_INTERVAL", "3"))   # seconds between sends
+MIN_SEND_INTERVAL  = int(os.getenv("MIN_SEND_INTERVAL", "3"))
 SEND_JITTER_MIN    = float(os.getenv("SEND_JITTER_MIN", "1"))
 SEND_JITTER_MAX    = float(os.getenv("SEND_JITTER_MAX", "3"))
 USED_WORDS_MAXLEN  = int(os.getenv("USED_WORDS_MAXLEN", "500"))
+
+# How long (seconds) to wait after a player word before accepting it,
+# so the GM has time to reject it first if it's invalid.
+PLAYER_CONFIRM_WINDOW = float(os.getenv("PLAYER_CONFIRM_WINDOW", "4"))
 
 WORDS_FILE = "vietnamese_words.txt"
 LOG_FILE   = "channel_messages.log"
@@ -66,13 +70,21 @@ class NoiTuSelfbot:
         self.last_word:            str | None = None
         self.last_word_message_id: int | None = None
 
-        self.used_words: deque[str]  = deque(maxlen=USED_WORDS_MAXLEN)
+        self.used_words: deque[str]    = deque(maxlen=USED_WORDS_MAXLEN)
         self._used_words_set: set[str] = set()
 
-        self.xd_messages:        set[int] = set()
+        self.xd_messages: set[int] = set()
 
         self.word_ready     = asyncio.Event()
         self.last_send_time = 0.0
+
+        # Tracks pending player words waiting for GM confirmation.
+        # Maps message_id -> (phrase, asyncio.Task)
+        self._pending_player: dict[int, tuple[str, asyncio.Task]] = {}
+
+        # Set to the message_id of a player word the GM just rejected,
+        # so the confirmation task can drop it.
+        self._gm_rejected_id: int | None = None
 
         self.client = commands.Bot(command_prefix="nt!", help_command=None)
         self.client.event(self.on_ready)
@@ -80,16 +92,6 @@ class NoiTuSelfbot:
         self.client.event(self.on_reaction_add)
 
     MAX_SYLLABLES = 2
-
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
-
-    def _track_used(self, word: str) -> None:
-        if len(self.used_words) == self.used_words.maxlen:
-            self._used_words_set.discard(self.used_words[0])
-        self.used_words.append(word)
-        self._used_words_set.add(word)
 
     # ------------------------------------------------------------------
     # Word loading & selection
@@ -115,8 +117,6 @@ class NoiTuSelfbot:
             raise SystemExit(1)
 
     def get_next_word(self, last_phrase: str) -> str | None:
-        if not last_phrase:
-            return None
         last_phrase   = normalize(last_phrase)
         syllables     = last_phrase.split()
         if not syllables:
@@ -144,24 +144,63 @@ class NoiTuSelfbot:
     # Helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _display_author(message: discord.Message) -> str:
-        author = message.author
-        disc = getattr(author, "discriminator", "0")
-        if not disc or disc == "0":
-            return author.name
-        return f"{author.name}#{disc}"
+    def _track_used(self, word: str) -> None:
+        if len(self.used_words) == self.used_words.maxlen:
+            self._used_words_set.discard(self.used_words[0])
+        self.used_words.append(word)
+        self._used_words_set.add(word)
 
     @staticmethod
     def _bot_x_reaction(message: discord.Message) -> bool:
         return any(str(r.emoji) == "X" and r.me for r in message.reactions)
 
     def _set_last_word(self, phrase: str, message_id: int) -> None:
-        """Update last_word and signal the game loop."""
+        """Commit a word as the current last_word and wake the game loop."""
         self.last_word            = phrase
         self.last_word_message_id = message_id
         self.word_ready.set()
-        log.info("last_word set to '%s' (msg_id=%d)", phrase, message_id)
+        log.info("last_word confirmed: '%s' (msg_id=%d)", phrase, message_id)
+
+    def _cancel_pending(self) -> None:
+        """Cancel all in-flight player confirmation tasks."""
+        for msg_id, (phrase, task) in list(self._pending_player.items()):
+            task.cancel()
+            log.info("Cancelled pending player word '%s' (msg_id=%d)", phrase, msg_id)
+        self._pending_player.clear()
+
+    # ------------------------------------------------------------------
+    # Player word confirmation
+    # ------------------------------------------------------------------
+
+    async def _confirm_player_word(self, phrase: str, message_id: int) -> None:
+        """
+        Wait PLAYER_CONFIRM_WINDOW seconds. If the GM hasn't rejected this
+        message by then, treat the word as valid and update last_word.
+        """
+        try:
+            await asyncio.sleep(PLAYER_CONFIRM_WINDOW)
+        except asyncio.CancelledError:
+            self._pending_player.pop(message_id, None)
+            return
+
+        self._pending_player.pop(message_id, None)
+
+        # GM rejected this specific message while we were waiting
+        if self._gm_rejected_id == message_id:
+            self._gm_rejected_id = None
+            log.info("Player word '%s' (msg_id=%d) rejected by GM — discarding.",
+                     phrase, message_id)
+            return
+
+        # Only accept if it's still newer than our current last_word
+        if (
+            self.last_word_message_id is None
+            or message_id > self.last_word_message_id
+        ):
+            self._set_last_word(phrase, message_id)
+        else:
+            log.info("Player word '%s' expired (older than current last_word) — discarding.",
+                     phrase)
 
     # ------------------------------------------------------------------
     # Discord events
@@ -170,6 +209,7 @@ class NoiTuSelfbot:
     async def on_ready(self) -> None:
         log.info("Logged in as %s (ID: %s)", self.client.user, self.client.user.id)
         log.info("Targeting channel ID %s", self.channel_id)
+        log.info("Player confirm window: %.1fs", PLAYER_CONFIRM_WINDOW)
         self.client.loop.create_task(self.game_loop())
         self.client.loop.create_task(self.heartbeat_check())
 
@@ -178,27 +218,22 @@ class NoiTuSelfbot:
         while not self.client.is_closed():
             await asyncio.sleep(30)
             log.info(
-                "[heartbeat] last_word=%s | last_msg_id=%s | xd=%d",
-                self.last_word, self.last_word_message_id, len(self.xd_messages),
+                "[heartbeat] last_word=%s | last_msg_id=%s | pending=%d | xd=%d",
+                self.last_word, self.last_word_message_id,
+                len(self._pending_player), len(self.xd_messages),
             )
 
     async def on_reaction_add(self, reaction: discord.Reaction, user: discord.User) -> None:
         message = reaction.message
         if message.channel.id != self.channel_id:
             return
-
-        # Bot placed an X — invalidate
         if user.id == self.client.user.id and str(reaction.emoji) == "X":
             self.xd_messages.add(message.id)
-            log.info("Bot X'd message %d from %s", message.id, message.author.name)
-            if (
-                self.last_word
-                and message.id == self.last_word_message_id
-                and self.find_last_valid_phrase(message.content) == self.last_word
-            ):
+            log.info("Bot X'd message %d", message.id)
+            if self.last_word and message.id == self.last_word_message_id:
                 self.last_word            = None
                 self.last_word_message_id = None
-                log.info("Cleared last_word because bot X'd the validated message")
+                log.info("Cleared last_word — X'd message was current anchor")
 
     async def on_message(self, message: discord.Message) -> None:
         if message.channel.id != self.channel_id:
@@ -210,13 +245,22 @@ class NoiTuSelfbot:
 
         # ── Game Master bot ──────────────────────────────────────────────
         if message.author.id == GAME_MASTER_BOT_ID:
-            content_lower = message.content.lower()
+            content_lower = normalize(message.content)
 
-            if "khong co trong tu dien" in content_lower:
-                log.info("GM: invalid word — keeping last_word='%s'", self.last_word)
+            # GM rejected the last player word — figure out which one
+            if "không có trong từ điển" in content_lower or "khong co trong tu dien" in content_lower:
+                # The most recently seen pending player message is the one that got rejected.
+                # Cancel all pending tasks — only one player word is in play at a time.
+                if self._pending_player:
+                    rejected_id = max(self._pending_player.keys())
+                    self._gm_rejected_id = rejected_id
+                    log.info("GM rejected word — cancelling pending msg_id=%d", rejected_id)
+                self._cancel_pending()
+                # Do NOT clear last_word — keep the last GM-confirmed or
+                # bot-sent word so the round can continue when someone gets it right.
                 return
 
-            # New round: "Luot noi tu moi da bat dau voi tu **{word}**!"
+            # GM announced a new round word: **word**
             match = re.search(r"\*\*(.+?)\*\*", message.content)
             if match:
                 phrase    = normalize(match.group(1))
@@ -225,6 +269,8 @@ class NoiTuSelfbot:
                     log.info("GM announced '%s' (%d syllables) — not 2-syllable, ignoring.",
                              phrase, len(syllables))
                     return
+                # Cancel any player words in flight — GM word takes priority
+                self._cancel_pending()
                 self._set_last_word(phrase, message.id)
             return
 
@@ -233,14 +279,24 @@ class NoiTuSelfbot:
             self.xd_messages.add(message.id)
             return
 
-        # Accept ANY valid phrase from a player — no reaction gate
         phrase = self.find_last_valid_phrase(message.content)
-        if phrase:
-            if (
-                self.last_word_message_id is None
-                or message.id > self.last_word_message_id
-            ):
-                self._set_last_word(phrase, message.id)
+        if not phrase:
+            return
+
+        # Only consider words newer than our current anchor
+        if self.last_word_message_id is not None and message.id <= self.last_word_message_id:
+            return
+
+        log.info("Player word candidate: '%s' (msg_id=%d) — waiting %.1fs for GM...",
+                 phrase, message.id, PLAYER_CONFIRM_WINDOW)
+
+        # Cancel any older pending task — we only track the latest candidate
+        self._cancel_pending()
+
+        task = self.client.loop.create_task(
+            self._confirm_player_word(phrase, message.id)
+        )
+        self._pending_player[message.id] = (phrase, task)
 
     # ------------------------------------------------------------------
     # Game loop
@@ -263,7 +319,6 @@ class NoiTuSelfbot:
             if self.last_word is None:
                 continue
 
-            # Short cooldown + jitter so it doesn't look robotic
             elapsed   = time.monotonic() - self.last_send_time
             jitter    = random.uniform(SEND_JITTER_MIN, SEND_JITTER_MAX)
             wait_left = (MIN_SEND_INTERVAL + jitter) - elapsed
