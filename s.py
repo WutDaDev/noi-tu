@@ -37,14 +37,34 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 DISCORD_TOKEN         = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID_RAW        = os.getenv("CHANNEL_ID")
+OWNER_ID              = int(os.getenv("OWNER_ID", "0"))
 GAME_MASTER_BOT_ID    = int(os.getenv("GAME_MASTER_BOT_ID", "1103932552701550622"))
-REQUIRED_REACTIONS    = int(os.getenv("REQUIRED_REACTIONS", "2"))
+REQUIRED_REACTIONS    = int(os.getenv("REQUIRED_REACTIONS", "1"))
 MIN_SEND_INTERVAL     = int(os.getenv("MIN_SEND_INTERVAL", "120"))
 # How many recently-used words to remember before allowing repeats
 USED_WORDS_MAXLEN     = int(os.getenv("USED_WORDS_MAXLEN", "500"))
-# How many recent messages to re-scan right before sending (triple-check).
+# How many recent messages to re-scan right before sending (triple-check)
+# when the channel is calm (< BUSY_TYPER_THRESHOLD people typing).
 # Default is 1 -- just the single latest channel message.
 TRIPLE_CHECK_HISTORY_LIMIT = int(os.getenv("TRIPLE_CHECK_HISTORY_LIMIT", "1"))
+# How many recent messages to check when the channel is busy (see below).
+# Kept modest on purpose -- this is still a single history fetch either way,
+# so it doesn't add extra API calls or risk a rate limit, it just looks
+# a bit further back in that one fetch.
+BUSY_CHECK_HISTORY_LIMIT = int(os.getenv("BUSY_CHECK_HISTORY_LIMIT", "5"))
+# Number of people concurrently typing in the channel at which we consider
+# it "busy" and switch to the deeper check above.
+BUSY_TYPER_THRESHOLD = int(os.getenv("BUSY_TYPER_THRESHOLD", "3"))
+# For high-concurrency events (e.g. a temporary channel unlock drawing ~20
+# active members at once instead of the usual handful), 3+ typers isn't a
+# fine enough signal -- 10-12+ people typing simultaneously is a different
+# situation from 3. This adds a third "packed" tier that looks back further
+# still, for when things are genuinely crowded.
+PACKED_TYPER_THRESHOLD    = int(os.getenv("PACKED_TYPER_THRESHOLD", "8"))
+PACKED_CHECK_HISTORY_LIMIT = int(os.getenv("PACKED_CHECK_HISTORY_LIMIT", "12"))
+# How long a "user is typing" indicator counts as still active. Discord's own
+# UI typing indicator times out after ~10s if no message follows.
+TYPING_WINDOW_SECONDS = int(os.getenv("TYPING_WINDOW_SECONDS", "10"))
 
 WORDS_FILE = "vietnamese_words.txt"
 LOG_FILE   = "channel_messages.log"
@@ -94,10 +114,18 @@ class NoiTuSelfbot:
         self.word_ready     = asyncio.Event()
         self.last_send_time = 0.0
 
+        # None = auto (use typing detection); "calm"/"busy"/"packed" = forced
+        self.force_mode: str | None = None
+
+        # user_id -> monotonic timestamp of their most recent typing event,
+        # used to gauge how busy the channel is right before we send.
+        self.typing_users: dict[int, float] = {}
+
         self.client = commands.Bot(command_prefix="nt!", help_command=None)
         self.client.event(self.on_ready)
         self.client.event(self.on_message)
         self.client.event(self.on_reaction_add)
+        self.client.event(self.on_typing)
 
     MAX_SYLLABLES = 2
 
@@ -192,6 +220,18 @@ class NoiTuSelfbot:
         """
         return any(str(r.emoji) == "X" and r.me for r in message.reactions)
 
+    def _active_typer_count(self) -> int:
+        """
+        How many distinct users currently count as "typing" in the target
+        channel, based on typing events seen in the last TYPING_WINDOW_SECONDS.
+        Stale entries are pruned as a side effect.
+        """
+        now = time.monotonic()
+        stale = [uid for uid, ts in self.typing_users.items() if now - ts > TYPING_WINDOW_SECONDS]
+        for uid in stale:
+            del self.typing_users[uid]
+        return len(self.typing_users)
+
     def _extract_gm_started_word(self, message: discord.Message) -> str | None:
         """
         Parse a game-master "new round" announcement, e.g.
@@ -276,6 +316,16 @@ class NoiTuSelfbot:
                 return False
         return True
 
+    async def on_typing(
+        self, channel: discord.abc.Messageable, user: discord.abc.User, when
+    ) -> None:
+        channel_id = getattr(channel, "id", None)
+        if channel_id != self.channel_id:
+            return
+        if user.id == self.client.user.id:
+            return
+        self.typing_users[user.id] = time.monotonic()
+
     async def on_reaction_add(self, reaction: discord.Reaction, user: discord.User) -> None:
         message = reaction.message
         if message.channel.id != self.channel_id:
@@ -304,6 +354,54 @@ class NoiTuSelfbot:
         await self._evaluate_message(message)
 
     async def on_message(self, message: discord.Message) -> None:
+        # ---- Owner DM commands ----------------------------------------
+        # DM the bot (from OWNER_ID) to force-lock the detection mode
+        # without touching .env or restarting.
+        #
+        #   !calm   -- single-message check, ignore typer count
+        #   !busy   -- 5-message check, ignore typer count
+        #   !packed -- 12-message check, ignore typer count
+        #   !auto   -- back to automatic typing-based detection
+        #   !mode   -- show current mode
+        #
+        if (
+            isinstance(message.channel, discord.DMChannel)
+            and OWNER_ID
+            and message.author.id == OWNER_ID
+        ):
+            cmd = message.content.strip().lower()
+            if cmd == "!calm":
+                self.force_mode = "calm"
+                await message.channel.send("✅ Mode locked to **calm** (1-message check).")
+                log.info("Owner forced mode: calm")
+            elif cmd == "!busy":
+                self.force_mode = "busy"
+                await message.channel.send("✅ Mode locked to **busy** (5-message check).")
+                log.info("Owner forced mode: busy")
+            elif cmd == "!packed":
+                self.force_mode = "packed"
+                await message.channel.send("✅ Mode locked to **packed** (12-message check).")
+                log.info("Owner forced mode: packed")
+            elif cmd == "!auto":
+                self.force_mode = None
+                await message.channel.send("✅ Mode set back to **auto** (typing-based detection).")
+                log.info("Owner cleared force mode -> auto")
+            elif cmd == "!mode":
+                typers = self._active_typer_count()
+                if self.force_mode:
+                    status = f"🔒 Forced to **{self.force_mode}** (auto is disabled)"
+                else:
+                    if typers >= PACKED_TYPER_THRESHOLD:
+                        current = "packed"
+                    elif typers >= BUSY_TYPER_THRESHOLD:
+                        current = "busy"
+                    else:
+                        current = "calm"
+                    status = f"🔄 Auto — currently **{current}** ({typers} typers detected)"
+                await message.channel.send(status)
+            return
+        # ---------------------------------------------------------------
+
         if message.channel.id != self.channel_id:
             return
         if message.author.id == self.client.user.id:
@@ -342,148 +440,44 @@ class NoiTuSelfbot:
     # ------------------------------------------------------------------
 
     async def _get_freshest_last_word(
-        self, channel: discord.abc.Messageable
+        self, channel: discord.abc.Messageable, history_limit: int
     ) -> tuple[str | None, int | None]:
         """
-        Check the single latest message in the channel right before we send.
-        This exists because MIN_SEND_INTERVAL can leave the bot idle for up
-        to a couple of minutes -- during that window a player can post a
-        valid word, or the game master can start a fresh round, and we want
-        to be sure we're replying to whatever is actually newest rather than
-        to whatever self.last_word happened to be set to earlier.
+        Re-check the channel right before we send, so a word that landed
+        while we were sleeping out MIN_SEND_INTERVAL isn't missed.
 
-        Only looks at the most recent message (TRIPLE_CHECK_HISTORY_LIMIT=1
-        by default). If that message isn't itself a usable word (not enough
-        reactions yet, GM error text, wrong syllable count, already X'd),
-        this falls back to the in-memory self.last_word / last_word_message_id
-        rather than digging further back -- the point is to catch something
-        that just landed, not to re-run full history validation.
+        history_limit controls how deep we look, in a single history fetch
+        (one API call either way -- this does not add extra requests, it just
+        asks for more messages in that one call):
+
+        - history_limit == 1 (calm channel, <= BUSY_TYPER_THRESHOLD - 1
+          people typing): only the single latest message is considered. If
+          it's not itself usable, we don't dig further -- fall back to
+          in-memory state. This is the fast/normal path.
+
+        - history_limit > 1 (busy channel, several people typing/chatting at
+          once): several messages can land almost simultaneously, so the
+          single latest one may not be the one that's actually valid (could
+          be an off-topic message, an un-reacted-to guess, etc). In that
+          case we keep scanning a few messages back to find the true latest
+          usable word instead of giving up after one miss.
         """
+        deep = history_limit > 1
         try:
-            async for message in channel.history(limit=TRIPLE_CHECK_HISTORY_LIMIT):
+            async for message in channel.history(limit=history_limit):
                 if message.author.id == self.client.user.id:
+                    if deep:
+                        continue
                     break
                 if message.id in self.xd_messages:
+                    if deep:
+                        continue
                     break
                 if self._bot_x_reaction(message, self.client.user.id):
                     self.xd_messages.add(message.id)
+                    if deep:
+                        continue
                     break
 
                 if message.author.id == GAME_MASTER_BOT_ID:
-                    phrase = self._extract_gm_started_word(message)
-                    if phrase is not None:
-                        return phrase, message.id
-                    break
-
-                total_reactions = sum(r.count for r in message.reactions)
-                if total_reactions < REQUIRED_REACTIONS:
-                    break
-
-                phrase = self.find_last_valid_phrase(message.content)
-                if phrase:
-                    return phrase, message.id
-                break
-        except discord.HTTPException as exc:
-            log.warning("Triple-check history fetch failed, using cached state: %s", exc)
-
-        return self.last_word, self.last_word_message_id
-
-    # ------------------------------------------------------------------
-    # Game loop
-    # ------------------------------------------------------------------
-
-    async def game_loop(self) -> None:
-        await self.client.wait_until_ready()
-        channel = self.client.get_channel(self.channel_id)
-        if channel is None:
-            log.error("Channel %d not found, bailing out.", self.channel_id)
-            return
-
-        log.info("Game loop started (min %ds between replies)", MIN_SEND_INTERVAL)
-
-        while not self.client.is_closed():
-            await self.word_ready.wait()
-            self.word_ready.clear()
-
-            if self.last_word is None:
-                continue
-
-            # Respect the minimum send interval
-            elapsed   = time.monotonic() - self.last_send_time
-            wait_left = MIN_SEND_INTERVAL - elapsed
-            if wait_left > 0:
-                await asyncio.sleep(wait_left)
-
-            # last_word may have been cleared while we were waiting
-            if self.last_word is None:
-                continue
-
-            current_word = self.last_word
-
-            # --- Triple-check -------------------------------------------------
-            # Right before we actually send, re-verify against live channel
-            # state. If a valid word landed while we were sleeping out the
-            # interval (and for whatever reason wasn't already picked up by
-            # on_message/on_reaction_add), use that instead of the stale word.
-            fresh_word, fresh_id = await self._get_freshest_last_word(channel)
-            if fresh_id is not None and (
-                self.last_word_message_id is None or fresh_id > self.last_word_message_id
-            ):
-                if fresh_word != current_word:
-                    log.info(
-                        "Triple-check: found newer word '%s' (msg_id=%d), "
-                        "overriding stale '%s' (msg_id=%s)",
-                        fresh_word, fresh_id, current_word, self.last_word_message_id,
-                    )
-                current_word              = fresh_word
-                self.last_word_message_id = fresh_id
-            # -------------------------------------------------------------------
-
-            next_word = self.get_next_word(current_word) if current_word else None
-
-            try:
-                if current_word is None:
-                    log.info("Triple-check found nothing valid to respond to, skipping.")
-                elif next_word is None:
-                    last_syl = current_word.split()[-1]
-                    log.info("No word starts with '%s', skipping silently.", last_syl)
-                else:
-                    await channel.send(next_word)
-                    self._track_used(next_word)
-                    log.info("Sent: '%s'", next_word)
-            except discord.HTTPException as exc:
-                log.error("Failed to send message: %s", exc)
-
-            self.last_send_time       = time.monotonic()
-            self.last_word            = None
-            self.last_word_message_id = None
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-async def main():
-    bot = NoiTuSelfbot()
-    await bot.load_words()
-
-    loop = asyncio.get_running_loop()
-
-    def _shutdown(sig, frame):
-        log.info("Received %s, shutting down...", signal.Signals(sig).name)
-        loop.create_task(bot.client.close())
-
-    for _sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(_sig, _shutdown)
-
-    try:
-        log.info("Starting bot...")
-        await bot.client.start(bot.token)
-    except discord.LoginFailure:
-        log.error("Invalid token -- fix your .env")
-    except Exception:
-        log.exception("Bot crashed")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+                    phrase = self._extract_gm_st
